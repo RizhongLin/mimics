@@ -1,0 +1,7 @@
+monai==0.9.1
+monai_weekly==0.10.dev2227
+numpy==1.21.0
+pytorch_lightning==1.6.4
+torch==1.12.0+cu116
+torchio==0.18.82
+wandb==0.13.1
