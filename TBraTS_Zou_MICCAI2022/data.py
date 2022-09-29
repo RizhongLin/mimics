@@ -28,8 +28,7 @@ class BraTS2019Data:
                         for s in glob(os.path.join(self.dataset_dir, '*', '*', "*seg.nii*"))]
             np.random.shuffle(subjects)
 
-            self.train_subjects, self.val_subjects, self.test_subjects = list_split(
-                subjects, self.split)
+            self.train_subjects, self.val_subjects, self.test_subjects = list_split(subjects, self.split)
 
             # save the train, val, test subjects into the subjects folder
             with open(os.path.join(self.dataset_dir, 'subjects', 'train.txt'), 'w') as f:
@@ -64,24 +63,18 @@ class BraTS2019Data:
     def get_data(self, split='train') -> List[Dict]:
         paths = self.get_paths(split)
 
-        flair_paths = [os.path.join(
-            p, os.path.basename(p) + '_flair.nii') for p in paths]
-        t1_paths = [os.path.join(p, os.path.basename(p) + '_t1.nii')
-                    for p in paths]
-        t1ce_paths = [os.path.join(
-            p, os.path.basename(p) + '_t1ce.nii') for p in paths]
-        t2_paths = [os.path.join(p, os.path.basename(p) + '_t2.nii')
-                    for p in paths]
-        seg_paths = [os.path.join(
-            p, os.path.basename(p) + '_seg.nii') for p in paths]
+        flair_paths = [os.path.join(p, os.path.basename(p) + '_flair.nii') for p in paths]
+        t1_paths = [os.path.join(p, os.path.basename(p) + '_t1.nii') for p in paths]
+        t1ce_paths = [os.path.join(p, os.path.basename(p) + '_t1ce.nii') for p in paths]
+        t2_paths = [os.path.join(p, os.path.basename(p) + '_t2.nii') for p in paths]
+        seg_paths = [os.path.join(p, os.path.basename(p) + '_seg.nii') for p in paths]
 
-        # return {'flair': flair_paths, 't1': t1_paths, 't1ce': t1ce_paths, 't2': t2_paths, 'seg': seg_paths}
         return [{'flair': flair, 't1': t1, 't1ce': t1ce, 't2': t2, 'seg': seg}
                 for flair, t1, t1ce, t2, seg in zip(flair_paths, t1_paths, t1ce_paths, t2_paths, seg_paths)]
 
 
 class BraTS2019DataModule(pl.LightningDataModule, ABC):
-    def __init__(self, batch_size: int = 4):
+    def __init__(self, batch_size: int = 4, num_workers: int = 0, test_noise_std: float = 0.0,):
         super().__init__()
 
         self.test_set = None
@@ -91,6 +84,9 @@ class BraTS2019DataModule(pl.LightningDataModule, ABC):
         self.val_subjects = None
         self.train_subjects = None
         self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.persistent_workers = num_workers > 0
+        self.test_noise_std = test_noise_std
 
     def prepare_data(self) -> None:
         all_data = BraTS2019Data()
@@ -111,15 +107,11 @@ class BraTS2019DataModule(pl.LightningDataModule, ABC):
     def get_preprocessing_transform() -> tio.Transform:
         return tio.Compose(
             [
-                # Rescale each modality to the range [0, 1]
-                tio.RescaleIntensity(out_min_max=(0, 1), in_min_max=(
-                    0, 500), include=['flair', 't1ce']),
-                tio.RescaleIntensity(out_min_max=(
-                    0, 1), in_min_max=(200, 700), include="t1"),
-                tio.RescaleIntensity(out_min_max=(
-                    0, 1), in_min_max=(200, 800), include="t2"),
-
                 tio.ToCanonical(),
+                # Rescale each modality to the range [0, 1]
+                tio.RescaleIntensity(out_min_max=(0, 1), in_min_max=(0, 500), include=('flair', 't1ce')),
+                tio.RescaleIntensity(out_min_max=(0, 1), in_min_max=(200, 700), include="t1"),
+                tio.RescaleIntensity(out_min_max=(0, 1), in_min_max=(200, 800), include="t2"),
                 tio.EnsureShapeMultiple(8),  # for the U-Net
                 tio.RemapLabels({4: 3}),  # for OneHot
                 tio.OneHot(num_classes=4),
@@ -130,10 +122,15 @@ class BraTS2019DataModule(pl.LightningDataModule, ABC):
         return tio.Compose([
             tio.CropOrPad(target_shape=(128, 128, 128), mask_name='seg'),
             tio.RandomFlip(axes=(0, 1, 2)),
-            tio.RandomGamma(p=0.5),
-            tio.RandomNoise(p=0.5),
-            tio.RandomMotion(p=0.1),
-            tio.RandomBiasField(p=0.25),
+            tio.RandomGamma(),
+            tio.RandomNoise(),
+            tio.RandomMotion(),
+            tio.RandomBiasField(),
+        ])
+
+    def get_test_transform(self) -> tio.Transform:
+        return tio.Compose([
+            tio.RandomNoise(std=self.test_noise_std),
         ])
 
     def setup(self, stage: Optional[str] = None) -> None:
@@ -144,17 +141,25 @@ class BraTS2019DataModule(pl.LightningDataModule, ABC):
         self.val_set = tio.SubjectsDataset(subjects=self.val_subjects,
                                            transform=self.get_preprocessing_transform())
         self.test_set = tio.SubjectsDataset(subjects=self.test_subjects,
-                                            transform=self.get_preprocessing_transform(),
+                                            transform=tio.Compose(
+                                                 [self.get_preprocessing_transform(),
+                                                  self.get_test_transform()]),
                                             load_getitem=False)
 
     def train_dataloader(self) -> DataLoader:
-        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=8)
+        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True,
+                          num_workers=self.num_workers,
+                          persistent_workers=self.persistent_workers)
 
     def val_dataloader(self) -> DataLoader:
-        return DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False, num_workers=8)
+        return DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False,
+                          num_workers=self.num_workers,
+                          persistent_workers=self.persistent_workers)
 
     def test_dataloader(self) -> DataLoader:
-        return DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=8)
+        return DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False,
+                          num_workers=self.num_workers,
+                          persistent_workers=self.persistent_workers)
 
 
 if __name__ == '__main__':
@@ -173,3 +178,26 @@ if __name__ == '__main__':
     print(f"train: {len(data.train_set)}")
     print(f"val:   {len(data.val_set)}")
     print(f"test:  {len(data.test_set)}")
+
+    for subject in (data.train_set[0], data.val_set[0]):
+        # get the first subject
+        flair = subject['flair']['data']
+        t1 = subject['t1']['data']
+        t1ce = subject['t1ce']['data']
+        t2 = subject['t2']['data']
+        seg = subject['seg']['data']
+
+        print("flair shape:", flair.shape)
+        print("t1 shape:", t1.shape)
+        print("t1ce shape:", t1ce.shape)
+        print("t2 shape:", t2.shape)
+        print("seg shape:", seg.shape)
+
+        print("flair min/max:", flair.min(), flair.max())
+        print("t1 min/max:", t1.min(), t1.max())
+        print("t1ce min/max:", t1ce.min(), t1ce.max())
+        print("t2 min/max:", t2.min(), t2.max())
+        print("seg unique:", [seg[i].unique() for i in range(seg.shape[0])])
+
+        # plot the first subject
+        subject.plot()
